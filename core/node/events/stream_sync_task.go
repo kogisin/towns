@@ -12,7 +12,7 @@ import (
 	"github.com/towns-protocol/towns/core/node/registries"
 )
 
-func (s *StreamCache) submitSyncStreamTask(
+func (s *StreamCache) SubmitSyncStreamTask(
 	ctx context.Context,
 	stream *Stream,
 ) {
@@ -30,9 +30,16 @@ func (s *StreamCache) submitSyncStreamTaskToPool(
 	stream *Stream,
 	streamRecord *registries.GetStreamResult,
 ) {
-	pool.Submit(func() {
-		s.syncStreamFromPeers(ctx, stream, streamRecord)
-	})
+	s.onlineSyncStreamTasksInProgressMu.Lock()
+	if s.onlineSyncStreamTasksInProgress.Add(stream.StreamId()) {
+		pool.Submit(func() {
+			s.syncStreamFromPeers(ctx, stream, streamRecord)
+			s.onlineSyncStreamTasksInProgressMu.Lock()
+			s.onlineSyncStreamTasksInProgress.Remove(stream.StreamId())
+			s.onlineSyncStreamTasksInProgressMu.Unlock()
+		})
+	}
+	s.onlineSyncStreamTasksInProgressMu.Unlock()
 }
 
 func (s *StreamCache) syncStreamFromPeers(
@@ -135,7 +142,7 @@ func (s *StreamCache) syncStreamFromSinglePeer(
 
 		currentToExclusive := min(currentFromInclusive+pageSize, toExclusive)
 
-		mbProtos, err := s.params.RemoteMiniblockProvider.GetMbs(
+		mbs, err := s.params.RemoteMiniblockProvider.GetMbs(
 			ctx,
 			remote,
 			stream.streamId,
@@ -146,20 +153,8 @@ func (s *StreamCache) syncStreamFromSinglePeer(
 			return currentFromInclusive, err
 		}
 
-		if len(mbProtos) == 0 {
+		if len(mbs) == 0 {
 			return currentFromInclusive, nil
-		}
-
-		mbs := make([]*MiniblockInfo, len(mbProtos))
-		for i, mbProto := range mbProtos {
-			mb, err := NewMiniblockInfoFromProto(
-				mbProto,
-				NewParsedMiniblockInfoOpts().WithExpectedBlockNumber(currentFromInclusive+int64(i)),
-			)
-			if err != nil {
-				return currentFromInclusive, err
-			}
-			mbs[i] = mb
 		}
 
 		err = stream.importMiniblocks(ctx, mbs)

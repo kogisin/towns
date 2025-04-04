@@ -72,13 +72,13 @@ func (s *Service) replicatedAddEventImpl(ctx context.Context, stream *Stream, ev
 	streamId := stream.StreamId()
 
 	// TODO: REPLICATION: TEST: setting so test can have more aggressive timeout
-	sender := NewQuorumPoolWithTimeoutForRemotes(2500*time.Millisecond, "method", "replicatedStream.AddEvent", "streamId", streamId)
+	sender := NewQuorumPool(ctx, NewQuorumPoolOpts().WriteModeWithTimeout(2500*time.Millisecond).WithTags("method", "replicatedStream.AddEvent", "streamId", streamId))
 
-	sender.GoLocal(ctx, func(ctx context.Context) error {
+	sender.AddTask(func(ctx context.Context) error {
 		return stream.AddEvent(ctx, event)
 	})
 
-	sender.GoRemotes(ctx, remotes, func(ctx context.Context, node common.Address) error {
+	sender.AddNodeTasks(remotes, func(ctx context.Context, node common.Address) error {
 		stub, err := s.nodeRegistry.GetNodeToNodeClientForAddress(node)
 		if err != nil {
 			return err
@@ -142,6 +142,7 @@ func (s *Service) replicatedAddMediaEventImpl(ctx context.Context, event *Parsed
 		PrevMiniblockHash: cc.PrevMiniblockHash,
 		Timestamp:         NextMiniblockTimestamp(nil),
 		EventHashes:       [][]byte{event.Hash[:]},
+		EventNumOffset:    cc.MiniblockNum + 1, // for media streams, each miniblock has only one event
 	}), event.MiniblockRef)
 	if err != nil {
 		return nil, err
@@ -153,7 +154,7 @@ func (s *Service) replicatedAddMediaEventImpl(ctx context.Context, event *Parsed
 	}
 
 	// genesisMiniblockHashes is needed to register the stream onchain if everything goes well.
-	nodes := NewStreamNodesWithLock(cc.NodeAddresses(), s.wallet.Address)
+	nodes := NewStreamNodesWithLock(len(cc.NodeAddresses()), cc.NodeAddresses(), s.wallet.Address)
 	remotes, _ := nodes.GetRemotesAndIsLocal()
 
 	var (
@@ -164,35 +165,31 @@ func (s *Service) replicatedAddMediaEventImpl(ctx context.Context, event *Parsed
 		quorum               *QuorumPool
 	)
 
+	quorumOpts := NewQuorumPoolOpts().WriteMode().WithTags("method", "replicatedAddMediaEvent", "streamId", streamId)
 	if seal {
 		// TODO: once nodes are updated to return the genesis miniblock hash in the response when sealing the
 		// stream only reach quorum when enough nodes voted for the same genesis miniblock hash.
 		// For now reach quorum when the local task and enough remotes have successfully sealed the stream
 		// without counting the genesis miniblock hash.
-		check := func() bool {
+		quorumOpts = quorumOpts.WithExternalQuorumCheck(func() bool {
 			quorumCheckMu.Lock()
 			defer quorumCheckMu.Unlock()
-
 			return streamSuccessCount >= requiredVotes && genesisMiniblockHash != (common.Hash{})
-		}
-
-		quorum = NewQuorumPoolWithQuorumCheck(check, "method", "replicatedAddMediaEvent", "streamId", streamId)
-	} else {
-		quorum = NewQuorumPool("method", "replicatedAddMediaEvent", "streamId", streamId)
+		})
 	}
+	quorum = NewQuorumPool(ctx, quorumOpts)
 
 	// Save the ephemeral miniblock locally
-	quorum.GoLocal(ctx, func(ctx context.Context) error {
+	quorum.AddTask(func(ctx context.Context) error {
 		mbBytes, err := proto.Marshal(ephemeralMb)
 		if err != nil {
 			return err
 		}
 
 		if err = s.storage.WriteEphemeralMiniblock(ctx, streamId, &storage.WriteMiniblockData{
-			Number:   cc.MiniblockNum,
-			Hash:     common.BytesToHash(ephemeralMb.Header.Hash),
-			Snapshot: false,
-			Data:     mbBytes,
+			Number: cc.MiniblockNum,
+			Hash:   common.BytesToHash(ephemeralMb.Header.Hash),
+			Data:   mbBytes,
 		}); err != nil {
 			return err
 		}
@@ -217,7 +214,7 @@ func (s *Service) replicatedAddMediaEventImpl(ctx context.Context, event *Parsed
 	})
 
 	// Save the ephemeral miniblock on remotes
-	quorum.GoRemotes(ctx, remotes, func(ctx context.Context, node common.Address) error {
+	quorum.AddNodeTasks(remotes, func(ctx context.Context, node common.Address) error {
 		stub, err := s.nodeRegistry.GetNodeToNodeClientForAddress(node)
 		if err != nil {
 			return err

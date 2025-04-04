@@ -1,15 +1,15 @@
 {
-    "name": "@river-build/xchain-monitor",
+    "name": "@towns-protocol/xchain-monitor",
     "type": "module",
-    "version": "0.0.180",
+    "version": "0.0.190",
     "packageManager": "yarn@3.8.0",
     "main": "dist/index.js",
     "publishConfig": {
         "access": "public"
     },
     "dependencies": {
-        "@river-build/generated": "workspace:^",
-        "@river-build/web3": "workspace:^",
+        "@towns-protocol/generated": "workspace:^",
+        "@towns-protocol/web3": "workspace:^",
         "dotenv": "^16.4.5",
         "esbuild-plugin-pino": "^2.2.0",
         "pino": "^8.17.1",

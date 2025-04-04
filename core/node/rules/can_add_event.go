@@ -20,7 +20,6 @@ import (
 	. "github.com/towns-protocol/towns/core/node/protocol"
 	"github.com/towns-protocol/towns/core/node/shared"
 	"github.com/towns-protocol/towns/core/xchain/bindings/erc20"
-	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -921,12 +920,17 @@ func (ru *aeBlockchainTransactionRules) validBlockchainTransaction_CheckReceiptM
 		idx := sort.Search(len(meta.GetPreTokenBalances()), func(i int) bool {
 			return meta.GetPreTokenBalances()[i].Mint == string(content.TokenTransfer.Address) && meta.GetPreTokenBalances()[i].Owner == sender
 		})
-		if idx == len(meta.GetPreTokenBalances()) {
-			return false, RiverError(Err_INVALID_ARGUMENT, "solana transfer transaction mint not found in preTokenBalances")
-		}
-		amountBefore, ok := new(big.Int).SetString(meta.GetPreTokenBalances()[idx].Amount.Amount, 0)
-		if !ok {
-			return false, RiverError(Err_INVALID_ARGUMENT, "invalid pre token balance amount")
+
+		// preTokenBalances isn't set when a user opens a token account (buys a token for the 1st time),
+		// so we need to check if it's not empty otherwise, we use 0 as the amount before
+		var amountBefore = big.NewInt(0)
+		if idx != len(meta.GetPreTokenBalances()) {
+			var ok bool
+			amountString := meta.GetPreTokenBalances()[idx].Amount.Amount
+			amountBefore, ok = new(big.Int).SetString(amountString, 0)
+			if !ok {
+				return false, RiverError(Err_INVALID_ARGUMENT, "invalid pre token balance amount", "amount", amountString)
+			}
 		}
 
 		// get the amount _after_ the transfer
@@ -2067,7 +2071,7 @@ func (params *aeParams) isValidNode(addressOrId []byte) bool {
 	return false
 }
 
-func (params *aeParams) log() *zap.SugaredLogger {
+func (params *aeParams) log() *logging.Log {
 	return logging.FromCtx(params.ctx)
 }
 

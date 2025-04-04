@@ -99,6 +99,18 @@ func (s *Service) newEventReceived(
 		return nil, err
 	}
 
+	view, err := stream.GetViewIfLocal(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if parsedEvent.MiniblockRef.Num >= 0 {
+		_, err = s.ensureStreamIsUpToDate(ctx, view, parsedEvent, stream)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	err = stream.AddEvent(ctx, parsedEvent)
 	if err != nil {
 		return nil, err
@@ -195,7 +207,15 @@ func (s *Service) saveMiniblockCandidate(
 		return nil, err
 	}
 
-	err = stream.SaveMiniblockCandidate(ctx, req.Miniblock)
+	mbInfo, err := NewMiniblockInfoFromProto(
+		req.GetMiniblock(), req.GetSnapshot(),
+		NewParsedMiniblockInfoOpts(),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	err = stream.SaveMiniblockCandidate(ctx, mbInfo)
 	if err != nil {
 		return nil, err
 	}
@@ -231,17 +251,31 @@ func (s *Service) streamMiniblocksByIds(
 		return err
 	}
 
-	if err = s.storage.ReadMiniblocksByIds(ctx, streamId, req.GetMiniblockIds(), func(blockdata []byte, seqNum int64) error {
-		var mb Miniblock
-		if err = proto.Unmarshal(blockdata, &mb); err != nil {
-			return WrapRiverError(Err_BAD_BLOCK, err).Message("Unable to unmarshal miniblock")
-		}
+	if err = s.storage.ReadMiniblocksByIds(
+		ctx,
+		streamId,
+		req.GetMiniblockIds(),
+		func(mbBytes []byte, seqNum int64, snBytes []byte) error {
+			var mb Miniblock
+			if err = proto.Unmarshal(mbBytes, &mb); err != nil {
+				return WrapRiverError(Err_BAD_BLOCK, err).Message("Unable to unmarshal miniblock")
+			}
 
-		return resp.Send(&GetMiniblockResponse{
-			Num:       seqNum,
-			Miniblock: &mb,
-		})
-	}); err != nil {
+			var snapshot *Envelope
+			if len(snBytes) > 0 && !req.GetOmitSnapshots() {
+				snapshot = &Envelope{}
+				if err = proto.Unmarshal(snBytes, snapshot); err != nil {
+					return WrapRiverError(Err_BAD_BLOCK, err).Message("Unable to unmarshal snapshot")
+				}
+			}
+
+			return resp.Send(&GetMiniblockResponse{
+				Num:       seqNum,
+				Miniblock: &mb,
+				Snapshot:  snapshot,
+			})
+		},
+	); err != nil {
 		return err
 	}
 

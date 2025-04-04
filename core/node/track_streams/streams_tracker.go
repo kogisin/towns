@@ -43,7 +43,7 @@ type StreamsTracker interface {
 
 	// A stream that does not meet criteria for tracking at the time it is created can later be added via
 	// AddStream. An error will be returned if the stream could not be successfully added to the sync runner.
-	AddStream(ctx context.Context, streamId shared.StreamId) error
+	AddStream(streamId shared.StreamId) error
 }
 
 var _ StreamsTracker = (*StreamsTrackerImpl)(nil)
@@ -53,6 +53,7 @@ var _ StreamsTracker = (*StreamsTrackerImpl)(nil)
 // views, which are application-specific. The filter implementation struct embeds this tracker implementation
 // and provides these methods for encapsulation.
 type StreamsTrackerImpl struct {
+	ctx            context.Context
 	filter         StreamFilter
 	nodeRegistries []nodes.NodeRegistry
 	riverRegistry  *registries.RiverRegistryContract
@@ -73,6 +74,7 @@ func (tracker *StreamsTrackerImpl) Init(
 	filter StreamFilter,
 	metricsFactory infra.MetricsFactory,
 ) error {
+	tracker.ctx = ctx
 	tracker.metrics = NewTrackStreamsSyncMetrics(metricsFactory)
 	tracker.riverRegistry = riverRegistry
 	tracker.onChainConfig = onChainConfig
@@ -86,6 +88,7 @@ func (tracker *StreamsTrackerImpl) Init(
 		ctx,
 		tracker.riverRegistry.Blockchain.InitialBlockNum,
 		tracker.OnStreamAllocated,
+		tracker.OnStreamAdded,
 		tracker.OnStreamLastMiniblockUpdated,
 		tracker.OnStreamPlacementUpdated,
 	); err != nil {
@@ -171,6 +174,7 @@ func (tracker *StreamsTrackerImpl) Run(ctx context.Context) error {
 	log.Infow("Loaded streams from streams registry",
 		"count", streamsLoaded,
 		"total", totalStreams,
+		"initialBlockNum", tracker.riverRegistry.Blockchain.InitialBlockNum,
 		"took", time.Since(start).String())
 
 	// wait till service stopped
@@ -208,14 +212,16 @@ func (tracker *StreamsTrackerImpl) forwardStreamEventsFromInception(
 	}
 }
 
-func (tracker *StreamsTrackerImpl) AddStream(ctx context.Context, streamId shared.StreamId) error {
+func (tracker *StreamsTrackerImpl) AddStream(streamId shared.StreamId) error {
 	stream, err := tracker.riverRegistry.StreamRegistry.GetStream(nil, streamId)
 	if err != nil {
 		return base.WrapRiverError(protocol.Err_CANNOT_CALL_CONTRACT, err).
 			Message("Could not fetch stream from contract")
 	}
 
-	tracker.forwardStreamEventsFromInception(ctx, streamId, stream.Nodes)
+	// Use tracker.ctx here so that the stream continues to  be synced after
+	// the originating request expires
+	tracker.forwardStreamEventsFromInception(tracker.ctx, streamId, stream.Nodes)
 	return nil
 }
 
@@ -224,9 +230,9 @@ func (tracker *StreamsTrackerImpl) AddStream(ctx context.Context, streamId share
 // responsible for it.
 func (tracker *StreamsTrackerImpl) OnStreamAllocated(
 	ctx context.Context,
-	event *river.StreamRegistryV1StreamAllocated,
+	event *river.StreamState,
 ) {
-	streamID := shared.StreamId(event.StreamId)
+	streamID := event.StreamID
 	if !tracker.filter.TrackStream(streamID) {
 		return
 	}
@@ -234,16 +240,31 @@ func (tracker *StreamsTrackerImpl) OnStreamAllocated(
 	tracker.forwardStreamEventsFromInception(ctx, streamID, event.Nodes)
 }
 
+// OnStreamAdded is called each time a stream is added in the river registry.
+// If the stream must be tracked for the service, then add it to the worker that is
+// responsible for it.
+func (tracker *StreamsTrackerImpl) OnStreamAdded(
+	ctx context.Context,
+	event *river.StreamState,
+) {
+	streamID := event.StreamID
+	if !tracker.filter.TrackStream(streamID) {
+		return
+	}
+
+	tracker.forwardStreamEventsFromInception(ctx, streamID, event.Stream.Nodes)
+}
+
 func (tracker *StreamsTrackerImpl) OnStreamLastMiniblockUpdated(
 	context.Context,
-	*river.StreamRegistryV1StreamLastMiniblockUpdated,
+	*river.StreamMiniblockUpdate,
 ) {
 	// miniblocks are processed when a stream event with a block header is received for the stream
 }
 
 func (tracker *StreamsTrackerImpl) OnStreamPlacementUpdated(
 	context.Context,
-	*river.StreamRegistryV1StreamPlacementUpdated,
+	*river.StreamState,
 ) {
 	// reserved when replacements are introduced
 	// 1. stop existing sync operation

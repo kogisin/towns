@@ -5,15 +5,69 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/ethereum/go-ethereum/common"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/ethereum/go-ethereum/common"
-
 	. "github.com/towns-protocol/towns/core/node/base"
+	"github.com/towns-protocol/towns/core/node/crypto"
 	"github.com/towns-protocol/towns/core/node/events/migrations"
 	. "github.com/towns-protocol/towns/core/node/protocol"
 	"github.com/towns-protocol/towns/core/node/shared"
 )
+
+// MakeSnapshotEnvelope creates a snapshot envelope from the given snapshot.
+func MakeSnapshotEnvelope(wallet *crypto.Wallet, snapshot *Snapshot) (*Envelope, error) {
+	snapshotBytes, err := proto.Marshal(snapshot)
+	if err != nil {
+		return nil, AsRiverError(err, Err_INTERNAL).
+			Message("Failed to serialize snapshot to bytes").
+			Func("MakeSnapshotEnvelope")
+	}
+
+	hash := crypto.TownsHashForSnapshots.Hash(snapshotBytes)
+	signature, err := wallet.SignHash(hash)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Envelope{
+		Event:     snapshotBytes,
+		Signature: signature,
+		Hash:      hash[:],
+	}, nil
+}
+
+// ParseSnapshot parses the given envelope into a snapshot.
+// It verifies the hash and signature of the envelope.
+func ParseSnapshot(envelope *Envelope, signer common.Address) (*Snapshot, error) {
+	hash := crypto.TownsHashForSnapshots.Hash(envelope.Event)
+	if !bytes.Equal(hash[:], envelope.Hash) {
+		return nil, RiverError(Err_BAD_EVENT_HASH, "Bad hash provided",
+			"computed", hash, "got", envelope.Hash).
+			Func("ParseSnapshot")
+	}
+
+	signerPubKey, err := crypto.RecoverSignerPublicKey(hash[:], envelope.Signature)
+	if err != nil {
+		return nil, err
+	}
+
+	var sn Snapshot
+	if err = proto.Unmarshal(envelope.Event, &sn); err != nil {
+		return nil, AsRiverError(err, Err_INVALID_ARGUMENT).
+			Message("Failed to decode snapshot from bytes").
+			Func("ParseSnapshot")
+	}
+
+	if addr := crypto.PublicKeyToAddress(signerPubKey); addr.Cmp(signer) != 0 {
+		return nil, RiverError(Err_BAD_EVENT_SIGNATURE, "Bad signature provided",
+			"computedAddress", addr,
+			"expectedAddress", signer).
+			Func("ParseSnapshot")
+	}
+
+	return &sn, nil
+}
 
 func Make_GenesisSnapshot(events []*ParsedEvent) (*Snapshot, error) {
 	if len(events) == 0 {
@@ -164,7 +218,7 @@ func Update_Snapshot(iSnapshot *Snapshot, event *ParsedEvent, miniblockNum int64
 	iSnapshot = migrations.MigrateSnapshot(iSnapshot)
 	switch payload := event.Event.Payload.(type) {
 	case *StreamEvent_SpacePayload:
-		return update_Snapshot_Space(iSnapshot, payload.SpacePayload, event.Event.CreatorAddress, eventNum)
+		return update_Snapshot_Space(iSnapshot, payload.SpacePayload, event.Event.CreatorAddress, eventNum, event.Hash.Bytes())
 	case *StreamEvent_ChannelPayload:
 		return update_Snapshot_Channel(iSnapshot, payload.ChannelPayload)
 	case *StreamEvent_DmChannelPayload:
@@ -193,6 +247,7 @@ func update_Snapshot_Space(
 	spacePayload *SpacePayload,
 	creatorAddress []byte,
 	eventNum int64,
+	eventHash []byte,
 ) error {
 	snapshot := iSnapshot.Content.(*Snapshot_SpaceContent)
 	if snapshot == nil {
@@ -249,6 +304,8 @@ func update_Snapshot_Space(
 		snapshot.SpaceContent.SpaceImage = &SpacePayload_SnappedSpaceImage{
 			Data:           content.SpaceImage,
 			CreatorAddress: creatorAddress,
+			EventNum:       eventNum,
+			EventHash:      eventHash,
 		}
 		return nil
 	default:

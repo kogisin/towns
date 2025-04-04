@@ -6,7 +6,7 @@ A hook that allows you to create a new group direct message (GDM).
 ## Imports
 
 ```ts
-import { useCreateGdm } from '@river-build/react-sdk'
+import { useCreateGdm } from '@towns-protocol/react-sdk'
 ```
 
 ## Definition
@@ -22,13 +22,15 @@ function useCreateGdm(
     isPending: boolean;
     isSuccess: boolean;
     isError: boolean;
-    createGDM: (userIds: string[], channelProperties?: EncryptedData | undefined, streamSettings?: PlainMessage<StreamSettings> | undefined) => Promise<{
+    createGDM: (userIds: string[], channelProperties?: EncryptedData | undefined, streamSettings?: {
+        disableMiniblockCreation: boolean;
+    } | undefined) => Promise<{
         streamId: string;
     }>;
 }
 ```
 
-**Source:** [useCreateGdm](https://github.com/river-build/river/blob/main/packages/react-sdk/src/useCreateGdm.ts)
+**Source:** [useCreateGdm](https://github.com/towns-protocol/towns/blob/main/packages/react-sdk/src/useCreateGdm.ts)
 
 ## Parameters
 
@@ -52,7 +54,9 @@ An object containing the `createGDM` action and the rest of the action result.
     isPending: boolean;
     isSuccess: boolean;
     isError: boolean;
-    createGDM: (userIds: string[], channelProperties?: EncryptedData | undefined, streamSettings?: PlainMessage<StreamSettings> | undefined) => Promise<{
+    createGDM: (userIds: string[], channelProperties?: EncryptedData | undefined, streamSettings?: {
+        disableMiniblockCreation: boolean;
+    } | undefined) => Promise<{
         streamId: string;
     }>;
 }

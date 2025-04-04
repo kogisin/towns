@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"os"
 	"slices"
@@ -18,8 +19,12 @@ import (
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
 	eth_crypto "github.com/ethereum/go-ethereum/crypto"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+
 	. "github.com/towns-protocol/towns/core/node/base"
+	"github.com/towns-protocol/towns/core/node/base/test"
 	"github.com/towns-protocol/towns/core/node/crypto"
 	"github.com/towns-protocol/towns/core/node/events"
 	"github.com/towns-protocol/towns/core/node/logging"
@@ -28,17 +33,72 @@ import (
 	river_sync "github.com/towns-protocol/towns/core/node/rpc/sync"
 	. "github.com/towns-protocol/towns/core/node/shared"
 	"github.com/towns-protocol/towns/core/node/testutils"
+	"github.com/towns-protocol/towns/core/node/testutils/dbtestutils"
 	"github.com/towns-protocol/towns/core/node/testutils/testfmt"
-	"google.golang.org/protobuf/proto"
 )
 
+var setupDB sync.Once
+
+// Creation of extensions can cause race conditions in the database even if
+// they are created with an "IF NOT EXISTS" clause, causing migrations across
+// multiple tests to fail. Therefore we create all required extensions in
+// pg one time here.
+func initPostgres() {
+	ctx, cancel := test.NewTestContext()
+	defer cancel()
+
+	// We are not creating a schema for this connection, therefore no need to tear
+	// it down - do not call the closer.
+	cfg, _, _, err := dbtestutils.ConfigureDbWithSchemaName(ctx, "")
+	if err != nil {
+		log.Fatalf("Unable to create postgres extensions: unable to configure db: %v", err)
+	}
+
+	conn, err := pgxpool.New(ctx, cfg.GetUrl())
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer conn.Close()
+	_, err = conn.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS btree_gin;")
+	if err != nil {
+		log.Fatalf("Unable to create extension: %v", err)
+	}
+}
+
 func TestMain(m *testing.M) {
+	setupDB.Do(initPostgres)
+
 	c := m.Run()
 	if c != 0 {
 		os.Exit(c)
 	}
 
 	crypto.TestMainForLeaksIgnoreGeth()
+}
+
+func createUserInboxStream(
+	ctx context.Context,
+	wallet *crypto.Wallet,
+	client protocolconnect.StreamServiceClient,
+	streamSettings *protocol.StreamSettings,
+) (*protocol.SyncCookie, []byte, error) {
+	userInboxStreamId := UserInboxStreamIdFromAddress(wallet.Address)
+	inception, err := events.MakeEnvelopeWithPayload(
+		wallet,
+		events.Make_UserInboxPayload_Inception(userInboxStreamId, streamSettings),
+		nil,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	res, err := client.CreateStream(ctx, connect.NewRequest(&protocol.CreateStreamRequest{
+		Events:   []*protocol.Envelope{inception},
+		StreamId: userInboxStreamId[:],
+	}))
+	if err != nil {
+		return nil, nil, err
+	}
+	return res.Msg.Stream.NextSyncCookie, inception.Hash, nil
 }
 
 func createUserMetadataStream(
@@ -213,6 +273,49 @@ func createSpace(
 	}
 
 	return resspace.Msg.Stream.NextSyncCookie, joinSpace.Hash, nil
+}
+
+func joinChannel(
+	ctx context.Context,
+	wallet *crypto.Wallet,
+	userStreamSyncCookie *protocol.SyncCookie,
+	client protocolconnect.StreamServiceClient,
+	spaceId StreamId,
+	channelId StreamId,
+) error {
+	userJoin, err := events.MakeEnvelopeWithPayload(
+		wallet,
+		events.Make_UserPayload_Membership(
+			protocol.MembershipOp_SO_JOIN,
+			channelId,
+			nil,
+			spaceId[:],
+		),
+		&MiniblockRef{
+			Hash: common.BytesToHash(userStreamSyncCookie.PrevMiniblockHash),
+			Num:  userStreamSyncCookie.MinipoolGen - 1,
+		},
+	)
+	if err != nil {
+		return err
+	}
+
+	add, err := client.AddEvent(
+		ctx,
+		connect.NewRequest(
+			&protocol.AddEventRequest{
+				StreamId: userStreamSyncCookie.StreamId,
+				Event:    userJoin,
+			},
+		),
+	)
+	if err != nil {
+		return err
+	}
+	if add.Msg.Error != nil {
+		return fmt.Errorf("Could not add join event to user stream: %v", add.Msg.Error.Msg)
+	}
+	return nil
 }
 
 func createChannel(
@@ -442,29 +545,13 @@ func testMethodsWithClient(tester *serviceTester, client protocolconnect.StreamS
 	require.NotNil(channel, "nil sync cookie")
 
 	// user2 joins channel
-	userJoin, err := events.MakeEnvelopeWithPayload(
-		wallet2,
-		events.Make_UserPayload_Membership(
-			protocol.MembershipOp_SO_JOIN,
-			channelId,
-			nil,
-			spaceId[:],
-		),
-		&MiniblockRef{
-			Hash: common.BytesToHash(resuser.PrevMiniblockHash),
-			Num:  resuser.MinipoolGen - 1,
-		},
-	)
-	require.NoError(err)
-
-	_, err = client.AddEvent(
+	err = joinChannel(
 		ctx,
-		connect.NewRequest(
-			&protocol.AddEventRequest{
-				StreamId: resuser.StreamId,
-				Event:    userJoin,
-			},
-		),
+		wallet2,
+		resuser,
+		client,
+		spaceId,
+		channelId,
 	)
 	require.NoError(err)
 
@@ -582,7 +669,7 @@ func testRiverDeviceId(tester *serviceTester) {
 		delegateSig,
 	)
 	require.NoError(err)
-	msg, err := events.MakeEnvelopeWithEvent(
+	envelope, err := events.MakeEnvelopeWithEvent(
 		deviceWallet,
 		event,
 	)
@@ -593,7 +680,7 @@ func testRiverDeviceId(tester *serviceTester) {
 		connect.NewRequest(
 			&protocol.AddEventRequest{
 				StreamId: channelId[:],
-				Event:    msg,
+				Event:    envelope,
 			},
 		),
 	)
@@ -604,24 +691,37 @@ func testRiverDeviceId(tester *serviceTester) {
 		connect.NewRequest(
 			&protocol.AddEventRequest{
 				StreamId: channelId[:],
-				Event:    msg,
+				Event:    envelope,
 			},
 		),
 	)
-	require.Error(err) // expected error when calling AddEvent
+	require.NoError(err) // Duplicate event is allowed
 
-	// send it optionally
+	// receive optional error
+	event, err = events.MakeDelegatedStreamEvent(
+		wallet,
+		events.Make_ChannelPayload_Inception(channelId, spaceId, nil),
+		channelHash,
+		delegateSig,
+	)
+	require.NoError(err)
+	envelope, err = events.MakeEnvelopeWithEvent(
+		deviceWallet,
+		event,
+	)
+	require.NoError(err)
+
 	resp, err := client.AddEvent(
 		ctx,
 		connect.NewRequest(
 			&protocol.AddEventRequest{
 				StreamId: channelId[:],
-				Event:    msg,
+				Event:    envelope,
 				Optional: true,
 			},
 		),
 	)
-	require.NoError(err) // expected error when calling AddEvent
+	require.NoError(err)
 	require.NotNil(resp.Msg.Error, "expected error")
 }
 
@@ -1703,7 +1803,7 @@ func TestSyncSubscriptionWithTooSlowClient(t *testing.T) {
 	}
 
 	// send a bunch of messages and ensure that the sync op is cancelled because the client can't keep up
-	for i := range 2500 {
+	for i := range 10000 {
 		if syncOpStopped.Load() { // no need to send additional messages, sync op already cancelled
 			break
 		}
@@ -1768,10 +1868,10 @@ func TestGetMiniblocksRangeLimit(t *testing.T) {
 		crypto.ABIEncodeUint64(uint64(expectedLimit)),
 	)
 
-	alice := tt.newTestClient(0)
+	alice := tt.newTestClient(0, testClientOpts{})
 	_ = alice.createUserStream()
 	spaceId, _ := alice.createSpace()
-	channelId, _ := alice.createChannel(spaceId)
+	channelId, _, _ := alice.createChannel(spaceId)
 
 	// Here we create a miniblock for each message sent by Alice.
 	// Creating a bit more miniblocks than limit.
@@ -1811,4 +1911,93 @@ func TestGetMiniblocksRangeLimit(t *testing.T) {
 
 		return true
 	}, 20*time.Second, 100*time.Millisecond)
+}
+
+func TestModifySyncWithWrongCookie(t *testing.T) {
+	tt := newServiceTester(t, serviceTesterOpts{numNodes: 2, start: true})
+
+	alice := tt.newTestClient(0, testClientOpts{enableSync: true})
+	cookie := alice.createUserStreamGetCookie()
+
+	alice.startSync()
+
+	// Replace node address in the cookie with the address of the other node
+	if common.BytesToAddress(cookie.NodeAddress) == tt.nodes[0].address {
+		cookie.NodeAddress = tt.nodes[1].address.Bytes()
+	} else {
+		cookie.NodeAddress = tt.nodes[0].address.Bytes()
+	}
+
+	testfmt.Print(t, "Modifying sync with wrong cookie")
+	resp, err := alice.client.ModifySync(alice.ctx, connect.NewRequest(&protocol.ModifySyncRequest{
+		SyncId:     alice.SyncID(),
+		AddStreams: []*protocol.SyncCookie{cookie},
+	}))
+	tt.require.NoError(err)
+	tt.require.Len(resp.Msg.GetAdds(), 0)
+	tt.require.Len(resp.Msg.GetRemovals(), 0)
+}
+
+func TestAddStreamToSyncWithWrongCookie(t *testing.T) {
+	tt := newServiceTester(t, serviceTesterOpts{numNodes: 2, start: true})
+
+	alice := tt.newTestClient(0, testClientOpts{enableSync: true})
+	_ = alice.createUserStreamGetCookie()
+	spaceId, _ := alice.createSpace()
+	channelId, _, cookie := alice.createChannel(spaceId)
+
+	alice.say(channelId, "hello from Alice")
+
+	alice.startSync()
+
+	// Replace node address in the cookie with the address of the other node
+	if common.BytesToAddress(cookie.NodeAddress) == tt.nodes[0].address {
+		cookie.NodeAddress = tt.nodes[1].address.Bytes()
+	} else {
+		cookie.NodeAddress = tt.nodes[0].address.Bytes()
+	}
+
+	testfmt.Print(t, "AddStreamToSync with wrong node address in cookie")
+	_, err := alice.client.AddStreamToSync(alice.ctx, connect.NewRequest(&protocol.AddStreamToSyncRequest{
+		SyncId:  alice.SyncID(),
+		SyncPos: cookie,
+	}))
+	tt.require.NoError(err)
+	testfmt.Print(t, "AddStreamToSync with wrong node address in cookie done")
+}
+
+func TestStartSyncWithWrongCookie(t *testing.T) {
+	tt := newServiceTester(t, serviceTesterOpts{numNodes: 2, start: true})
+
+	alice := tt.newTestClient(0, testClientOpts{enableSync: false})
+	_ = alice.createUserStreamGetCookie()
+	spaceId, _ := alice.createSpace()
+	channelId, _, cookie := alice.createChannel(spaceId)
+
+	// Replace node address in the cookie with the address of the other node
+	if common.BytesToAddress(cookie.NodeAddress) == tt.nodes[0].address {
+		cookie.NodeAddress = tt.nodes[1].address.Bytes()
+	} else {
+		cookie.NodeAddress = tt.nodes[0].address.Bytes()
+	}
+
+	alice.say(channelId, "hello from Alice")
+
+	testfmt.Print(t, "StartSync with wrong cookie")
+	syncCtx, syncCancel := context.WithTimeout(alice.ctx, 10*time.Second)
+	defer syncCancel()
+	updates, err := alice.client.SyncStreams(syncCtx, connect.NewRequest(&protocol.SyncStreamsRequest{
+		SyncPos: []*protocol.SyncCookie{cookie},
+	}))
+	tt.require.NoError(err)
+	testfmt.Print(t, "StartSync with wrong cookie done")
+
+	for updates.Receive() {
+		msg := updates.Msg()
+		if msg.GetSyncOp() == protocol.SyncOp_SYNC_UPDATE &&
+			testutils.StreamIdFromBytes(msg.GetStream().GetNextSyncCookie().GetStreamId()) == channelId {
+			syncCancel()
+		}
+	}
+	tt.require.ErrorIs(updates.Err(), context.Canceled)
 }

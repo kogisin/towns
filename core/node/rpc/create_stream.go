@@ -157,7 +157,7 @@ func (s *Service) createReplicatedStream(
 	streamId StreamId,
 	parsedEvents []*ParsedEvent,
 ) (*StreamAndCookie, error) {
-	mb, err := MakeGenesisMiniblock(s.wallet, parsedEvents)
+	mb, sn, err := MakeGenesisMiniblock(s.wallet, parsedEvents)
 	if err != nil {
 		return nil, err
 	}
@@ -172,13 +172,13 @@ func (s *Service) createReplicatedStream(
 		return nil, err
 	}
 
-	nodes := NewStreamNodesWithLock(nodesList, s.wallet.Address)
+	nodes := NewStreamNodesWithLock(len(nodesList), nodesList, s.wallet.Address)
 	remotes, isLocal := nodes.GetRemotesAndIsLocal()
-	sender := NewQuorumPool("method", "createReplicatedStream", "streamId", streamId)
+	sender := NewQuorumPool(ctx, NewQuorumPoolOpts().WriteMode().WithTags("method", "createReplicatedStream", "streamId", streamId))
 
 	var localSyncCookie atomic.Pointer[SyncCookie]
 	if isLocal {
-		sender.GoLocal(ctx, func(ctx context.Context) error {
+		sender.AddTask(func(ctx context.Context) error {
 			st, err := s.cache.GetStreamNoWait(ctx, streamId)
 			if err != nil {
 				return err
@@ -195,7 +195,7 @@ func (s *Service) createReplicatedStream(
 	var remoteSyncCookie *SyncCookie
 	var remoteSyncCookieOnce sync.Once
 	if len(remotes) > 0 {
-		sender.GoRemotes(ctx, remotes, func(ctx context.Context, node common.Address) error {
+		sender.AddNodeTasks(remotes, func(ctx context.Context, node common.Address) error {
 			stub, err := s.nodeRegistry.GetNodeToNodeClientForAddress(node)
 			if err != nil {
 				return err
@@ -206,6 +206,7 @@ func (s *Service) createReplicatedStream(
 					&AllocateStreamRequest{
 						StreamId:  streamId[:],
 						Miniblock: mb,
+						Snapshot:  sn,
 					},
 				),
 			)
@@ -232,5 +233,6 @@ func (s *Service) createReplicatedStream(
 	return &StreamAndCookie{
 		NextSyncCookie: cookie,
 		Miniblocks:     []*Miniblock{mb},
+		Snapshot:       sn,
 	}, nil
 }
